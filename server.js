@@ -1,17 +1,28 @@
+// ✅ InplayStream — WebRTC signaling + room-based chat
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 
 const app = express();
-app.use(cors());
+app.use(express.json());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST"]
+}));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: {
+    origin: "*",
+    credentials: true
+  }
 });
 
-let chatHistory = [];
+// Room memory structure
+// rooms = { [roomId] : { teacherConnected: boolean, users: Map(socketId -> { name, role }) } }
+const rooms = {};
 
 app.get("/", (req, res) => {
   res.send("✅ InplayStream backend is LIVE");
@@ -20,23 +31,70 @@ app.get("/", (req, res) => {
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
 
-  // send existing history to the new client
-  socket.emit("chatHistory", chatHistory);
+  // ✅ Join room (both teacher and students)
+  socket.on("join-room", ({ roomId, user, role }) => {
+    if (!roomId) return;
 
-  socket.on("chatMessage", (data) => {
-    chatHistory.push(data);
-    io.emit("chatMessage", data);
+    if (!rooms[roomId]) {
+      rooms[roomId] = { teacherConnected: false, users: new Map() };
+    }
+
+    const room = rooms[roomId];
+
+    if (role === "Teacher") {
+      room.teacherConnected = true;
+    }
+
+    socket.join(roomId);
+    room.users.set(socket.id, { user, role });
+
+    console.log(`👤 ${role} "${user}" joined room ${roomId}`);
+
+    // Notify teacher that student joined
+    socket.to(roomId).emit("user-joined", { user, role });
+
+    // Notify new user of room state
+    socket.emit("room-status", { teacherConnected: room.teacherConnected });
   });
 
-  // optional: signaling hooks (safe to keep)
-  socket.on("offer", (payload) => socket.to(payload.target).emit("offer", payload));
-  socket.on("answer", (payload) => socket.to(payload.target).emit("answer", payload));
-  socket.on("ice-candidate", (incoming) => socket.to(incoming.target).emit("ice-candidate", incoming.candidate));
+  // ✅ WebRTC signaling
+  socket.on("offer", ({ roomId, signal }) => {
+    socket.to(roomId).emit("offer", { signal });
+  });
 
+  socket.on("answer", ({ roomId, signal }) => {
+    socket.to(roomId).emit("answer", { signal });
+  });
+
+  // ✅ Chat inside room only
+  socket.on("chatMessage", (msg) => {
+    const { roomId } = msg;
+    if (!roomId) return;
+    socket.to(roomId).emit("chatMessage", msg);
+  });
+
+  // ✅ Disconnect + cleanup
   socket.on("disconnect", () => {
+    for (const roomId in rooms) {
+      const room = rooms[roomId];
+      if (room.users.has(socket.id)) {
+        const { role } = room.users.get(socket.id);
+        room.users.delete(socket.id);
+
+        if (role === "Teacher") {
+          room.teacherConnected = false;
+          socket.to(roomId).emit("room-status", { teacherConnected: false });
+        }
+
+        if (room.users.size === 0 && !room.teacherConnected) {
+          delete rooms[roomId];
+        }
+        break;
+      }
+    }
     console.log("🔴 User disconnected:", socket.id);
   });
 });
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Backend running on PORT ${PORT}`));
